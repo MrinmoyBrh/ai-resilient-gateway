@@ -1,26 +1,30 @@
 import { Worker, Job } from 'bullmq';
-import { redisConnection } from '../config/redis.js';
+import { redisOptions, redisPublisher } from '../config/redis.js';
 import { pool } from '../config/db.js';
-import { AI_QUEUE_NAME } from './queue.js';
 import { LLMOrchestrator } from './orchestrator.js';
-import { AIJobPayload, AIJobResult } from '../types/index.js';
+import { AIJobPayload } from '../types/index.js';
 
 export function startWorker() {
-  const worker = new Worker<AIJobPayload, AIJobResult>(
-    AI_QUEUE_NAME,
+  const worker = new Worker(
+    'ai-tasks',
     async (job: Job<AIJobPayload>) => {
-      console.log(`[Worker] Processing Job ID: ${job.data.jobId} (Tenant: ${job.data.tenantId})`);
+      console.log(`[Worker] Started processing job: ${job.data.jobId}`);
+      const { jobId, tenantId } = job.data;
 
-      // Update status in PostgreSQL to 'processing'
+      // 1. Mark processing & broadcast via SSE
       await pool.query(
         `UPDATE jobs SET status = 'processing', updated_at = NOW() WHERE id = $1`,
-        [job.data.jobId]
+        [jobId]
+      );
+      await redisPublisher.publish(
+        `job-events:${jobId}`,
+        JSON.stringify({ status: 'processing', jobId })
       );
 
-      // Execute AI task with automatic failover
+      // 2. Execute LLM inference
       const result = await LLMOrchestrator.executeWithFallback(job.data);
 
-      // Update job to completed
+      // 3. Mark completed & broadcast via SSE
       await pool.query(
         `UPDATE jobs 
          SET status = 'completed', 
@@ -35,17 +39,16 @@ export function startWorker() {
           result.providerResolved,
           result.modelResolved,
           result.latencyMs,
-          job.data.jobId,
+          jobId,
         ]
       );
 
-      // Insert audit usage log
       await pool.query(
         `INSERT INTO usage_logs (tenant_id, job_id, provider, model, prompt_tokens, completion_tokens, latency_ms)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
-          job.data.tenantId,
-          job.data.jobId,
+          tenantId,
+          jobId,
           result.providerResolved,
           result.modelResolved,
           result.tokens.prompt,
@@ -54,27 +57,42 @@ export function startWorker() {
         ]
       );
 
+      await redisPublisher.publish(
+        `job-events:${jobId}`,
+        JSON.stringify({
+          status: 'completed',
+          jobId,
+          result: result.content,
+          latencyMs: result.latencyMs,
+        })
+      );
+
+      console.log(`[Worker] Finished job ${jobId}`);
       return result;
     },
     {
-      connection: redisConnection,
-      concurrency: 5, // Process 5 tasks simultaneously
+      connection: redisOptions, // Pass options object here as well
+      concurrency: 5,
     }
   );
 
-  worker.on('completed', (job) => {
-    console.log(`[Worker] Job ${job.data.jobId} completed successfully.`);
+  worker.on('active', (job) => {
+    console.log(`[Worker] Job active: ${job.id}`);
   });
 
   worker.on('failed', async (job, err) => {
-    console.error(`[Worker] Job ${job?.data?.jobId} failed:`, err.message);
-    if (job) {
-      await pool.query(
-        `UPDATE jobs SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
-        [err.message, job.data.jobId]
-      );
-    }
-  });
+    if (!job) return;
+    const { jobId } = job.data;
+    console.error(`[Worker] Job failed: ${jobId}`, err);
 
-  return worker;
+    await pool.query(
+      `UPDATE jobs SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
+      [err.message, jobId]
+    );
+
+    await redisPublisher.publish(
+      `job-events:${jobId}`,
+      JSON.stringify({ status: 'failed', jobId, error: err.message })
+    );
+  });
 }

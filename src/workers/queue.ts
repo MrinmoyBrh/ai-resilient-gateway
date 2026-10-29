@@ -4,7 +4,7 @@ import { AIJobPayload } from '../types/index.js';
 
 export const AI_QUEUE_NAME = 'ai-orchestration-queue';
 
-export const aiQueue = new Queue<AIJobPayload>(AI_QUEUE_NAME, {
+export const aiQueue = new Queue('ai-tasks', {
   connection: redisConnection,
   defaultJobOptions: {
     attempts: 3,
