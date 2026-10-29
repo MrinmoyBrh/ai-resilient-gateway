@@ -1,0 +1,32 @@
+{
+  "name": "ai-resilient-gateway",
+  "version": "1.0.0",
+  "description": "Adaptive AI Gateway & Resilient Workflow Engine",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/cors": "^11.3.1",
+    "@google/genai": "^2.31.0",
+    "bullmq": "^6.5.1",
+    "dotenv": "^18.0.9",
+    "fastify": "^5.12.7",
+    "ioredis": "^6.0.0",
+    "openai": "^7.45.1",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
