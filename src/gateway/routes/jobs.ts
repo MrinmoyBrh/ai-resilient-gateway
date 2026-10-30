@@ -110,4 +110,36 @@ export async function jobRoutes(fastify: FastifyInstance) {
       });
     }
   );
+  // GET /v1/tenants/analytics
+fastify.get('/v1/tenants/analytics', async (req: FastifyRequest, reply: FastifyReply) => {
+  const apiKey = req.headers['x-api-key'] as string;
+  if (!apiKey) return reply.status(401).send({ error: 'Missing x-api-key' });
+
+  // Fetch tenant info and aggregated telemetry
+  const query = `
+    SELECT 
+      t.id AS tenant_id,
+      t.name AS tenant_name,
+      t.rpm_limit,
+      COUNT(j.id)::INT AS total_jobs,
+      COUNT(CASE WHEN j.status = 'completed' THEN 1 END)::INT AS completed_jobs,
+      COUNT(CASE WHEN j.status = 'failed' THEN 1 END)::INT AS failed_jobs,
+      COALESCE(AVG(j.latency_ms)::INT, 0) AS avg_latency_ms,
+      COALESCE(SUM(u.prompt_tokens), 0)::INT AS total_prompt_tokens,
+      COALESCE(SUM(u.completion_tokens), 0)::INT AS total_completion_tokens
+    FROM tenants t
+    LEFT JOIN jobs j ON t.id = j.tenant_id
+    LEFT JOIN usage_logs u ON j.id = u.job_id
+    WHERE t.api_key = $1
+    GROUP BY t.id, t.name, t.rpm_limit;
+  `;
+
+  const res = await pool.query(query, [apiKey]);
+
+  if (res.rows.length === 0) {
+    return reply.status(404).send({ error: 'Tenant not found' });
+  }
+
+  return reply.send(res.rows[0]);
+});
 }
