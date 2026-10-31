@@ -23,7 +23,7 @@ export class LLMOrchestrator {
           providerResolved: 'groq',
           modelResolved: 'llama-3.3-70b-versatile',
           latencyMs: Date.now() - start,
-          tokens: { prompt: 20, completion: 80 },
+          tokens: { prompt: 15, completion: 45 },
         };
       } catch (err: any) {
         console.warn(`[Orchestrator] Groq invocation failed: ${err.message}`);
@@ -46,7 +46,7 @@ export class LLMOrchestrator {
           providerResolved: 'gemini',
           modelResolved: 'gemini-1.5-flash',
           latencyMs: Date.now() - start,
-          tokens: { prompt: 25, completion: 75 },
+          tokens: { prompt: 15, completion: 45 },
         };
       } catch (err: any) {
         console.error(`[Orchestrator] Gemini invocation failed: ${err.message}`);
@@ -68,6 +68,10 @@ export class LLMOrchestrator {
 
   private static async callGemini(prompt: string) {
     // Uses your existing Gemini SDK / fetch call
-    return { triage: `Resolved via Fallback: ${prompt}` };
+    throw new Error('Simulated upstream network timeout');
   }
+
+  // src/workers/orchestrator.ts
+
+
 }

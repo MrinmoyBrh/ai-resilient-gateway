@@ -3,13 +3,15 @@ import { redisOptions, redisPublisher } from '../config/redis.js';
 import { pool } from '../config/db.js';
 import { LLMOrchestrator } from './orchestrator.js';
 import { AIJobPayload } from '../types/index.js';
+import { PromptCache } from '../services/cache.js';
+import { log } from 'console';
 
 export function startWorker() {
   const worker = new Worker(
     'ai-tasks',
     async (job: Job<AIJobPayload>) => {
       console.log(`[Worker] Started processing job: ${job.data.jobId}`);
-      const { jobId, tenantId } = job.data;
+      const { jobId, tenantId, prompt } = job.data;
 
       // 1. Mark processing & broadcast via SSE
       await pool.query(
@@ -42,7 +44,11 @@ export function startWorker() {
           jobId,
         ]
       );
-
+      
+      // 4. Cache the result into Redis for identical future prompts
+      await PromptCache.set(prompt, result.content);
+      
+      // 5. Insert telemetry usage logs
       await pool.query(
         `INSERT INTO usage_logs (tenant_id, job_id, provider, model, prompt_tokens, completion_tokens, latency_ms)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -57,6 +63,7 @@ export function startWorker() {
         ]
       );
 
+      // 6. Broadcast completion event via Redis Pub/Sub
       await redisPublisher.publish(
         `job-events:${jobId}`,
         JSON.stringify({
@@ -82,17 +89,38 @@ export function startWorker() {
 
   worker.on('failed', async (job, err) => {
     if (!job) return;
-    const { jobId } = job.data;
-    console.error(`[Worker] Job failed: ${jobId}`, err);
+    const attemptsMade = job.attemptsMade;
+    const maxAttempts = job.opts.attempts || 1;
+
+    console.warn(
+    `[Worker] Job ${job.data.jobId} failed attempt ${attemptsMade}/${maxAttempts}: ${err.message}`
+  );
+
+  // If retries remain, keep status in retry loop and broadcast retry event
+  if (attemptsMade < maxAttempts) {
+    await redisPublisher.publish(
+      `job-events:${job.data.jobId}`,
+      JSON.stringify({
+        status: 'retrying',
+        jobId: job.data.jobId,
+        attempt: attemptsMade,
+        maxAttempts,
+      })
+    );
+    return;
+  }
+
+  // All attempts exhausted: Move permanently to terminal failed state (DLQ)
+  console.error(`[Worker] Job ${job.data.jobId} exhausted all retries. Moving to terminal failed state.`);
 
     await pool.query(
       `UPDATE jobs SET status = 'failed', error_message = $1, updated_at = NOW() WHERE id = $2`,
-      [err.message, jobId]
+      [err.message, job.data.jobId]
     );
 
     await redisPublisher.publish(
-      `job-events:${jobId}`,
-      JSON.stringify({ status: 'failed', jobId, error: err.message })
+      `job-events:${job.data.jobId}`,
+      JSON.stringify({ status: 'failed', jobId: job.data.jobId, error: err.message })
     );
   });
 }

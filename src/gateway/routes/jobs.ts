@@ -4,6 +4,7 @@ import { pool } from '../../config/db.js';
 import { tenantRateLimiter } from '../middleware/rateLimiter.js';
 import { AIJobPayload } from '../../types/index.js';
 import { Redis } from 'ioredis';
+import { PromptCache } from '../../services/cache.js';
 
 interface SubmitBody {
   prompt: string;
@@ -22,6 +23,19 @@ export async function jobRoutes(fastify: FastifyInstance) {
         return reply.status(400).send({ error: 'Missing prompt in request body' });
       }
 
+      // 1. Zero-Cost Cache Check
+      const cachedResult = await PromptCache.get(prompt);
+      if (cachedResult) {
+        return reply.status(200).send({
+          source: 'cache',
+          cached: true,
+          status: 'completed',
+          result: cachedResult,
+          latencyMs: 2,
+        });
+      }
+
+      // 2. Cache Miss: Enqueue Task
       const jobRes = await pool.query(
         `INSERT INTO jobs (tenant_id, prompt, status) VALUES ($1, $2, 'queued') RETURNING id`,
         [tenant.id, prompt]
@@ -36,9 +50,19 @@ export async function jobRoutes(fastify: FastifyInstance) {
         taskType: 'incident_triage',
       };
 
-      await aiQueue.add('triage-job', payload);
+      await aiQueue.add('triage-job', payload, {
+        attempts: 3,
+        backoff: {
+        type: 'exponential',
+        delay: 1000,
+      },
+      removeOnComplete: true,
+      removeOnFail: false,
+      });
 
       return reply.status(202).send({
+        source: 'queue',
+        cached: false,
         message: 'Job queued successfully',
         jobId,
         status: 'queued',
