@@ -5,25 +5,50 @@ import { tenantRateLimiter } from '../middleware/rateLimiter.js';
 import { AIJobPayload } from '../../types/index.js';
 import { Redis } from 'ioredis';
 import { PromptCache } from '../../services/cache.js';
+import { TelemetryService } from '../../services/telemetry.js';
 
-interface SubmitBody {
+
+interface SubmitJobBody {
   prompt: string;
 }
 
-export async function jobRoutes(fastify: FastifyInstance) {
-  // 1. Submit Job
-  fastify.post<{ Body: SubmitBody }>(
-    '/v1/jobs/submit',
-    { preHandler: tenantRateLimiter },
-    async (req: FastifyRequest<{ Body: SubmitBody }>, reply: FastifyReply) => {
-      const { prompt } = req.body || {};
-      const tenant = (req as any).tenant;
+interface JobParams {
+  id: string;
+}
 
-      if (!prompt) {
-        return reply.status(400).send({ error: 'Missing prompt in request body' });
+export async function jobRoutes(server: FastifyInstance) {
+  // 1. Submit a task
+  server.post(
+    '/v1/jobs/submit',
+    async (
+      request: FastifyRequest<{ Body: SubmitJobBody }>,
+      reply: FastifyReply
+    ) => {
+      const { prompt } = request.body || {};
+
+      if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
+        return reply.status(400).send({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'Field "prompt" is required and must be a non-empty string.',
+        });
       }
 
-      // 1. Zero-Cost Cache Check
+      // Default fallback tenant ID if authentication middleware has not attached one
+      const tenantId =
+        (request as any).tenant?.id || 'a0000000-0000-0000-0000-000000000001';
+
+      // Step A: Check 24-hour rolling token quota
+      const quotaCheck = await TelemetryService.checkQuota(tenantId);
+      if (!quotaCheck.allowed) {
+        return reply.status(429).send({
+          statusCode: 429,
+          error: 'Too Many Requests',
+          message: `Daily token quota exceeded (${quotaCheck.used}/${quotaCheck.quota} tokens used in the last 24 hours).`,
+        });
+      }
+
+      // Step B: Check Redis SHA-256 prompt cache (<5ms response)
       const cachedResult = await PromptCache.get(prompt);
       if (cachedResult) {
         return reply.status(200).send({
@@ -35,29 +60,31 @@ export async function jobRoutes(fastify: FastifyInstance) {
         });
       }
 
-      // 2. Cache Miss: Enqueue Task
-      const jobRes = await pool.query(
-        `INSERT INTO jobs (tenant_id, prompt, status) VALUES ($1, $2, 'queued') RETURNING id`,
-        [tenant.id, prompt]
+      // Step C: Initialize job entry in PostgreSQL
+      const insertResult = await pool.query(
+        `INSERT INTO jobs (tenant_id, prompt, status)
+         VALUES ($1, $2, 'queued')
+         RETURNING id`,
+        [tenantId, prompt]
       );
 
-      const jobId = jobRes.rows[0].id;
+      const jobId = insertResult.rows[0].id;
 
-      const payload: AIJobPayload = {
+      // Step D: Enqueue task with exponential backoff retry configuration
+      const payload = {
         jobId,
-        tenantId: tenant.id,
+        tenantId,
         prompt,
-        taskType: 'incident_triage',
       };
 
       await aiQueue.add('triage-job', payload, {
         attempts: 3,
         backoff: {
-        type: 'exponential',
-        delay: 1000,
-      },
-      removeOnComplete: true,
-      removeOnFail: false,
+          type: 'exponential',
+          delay: 1000,
+        },
+        removeOnComplete: true,
+        removeOnFail: false,
       });
 
       return reply.status(202).send({
@@ -72,98 +99,103 @@ export async function jobRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // 2. Poll Status
-  fastify.get<{ Params: { id: string } }>(
+  // 2. Poll job status
+  server.get(
     '/v1/jobs/:id',
-    async (req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-      const { id } = req.params;
-      const res = await pool.query(`SELECT * FROM jobs WHERE id = $1`, [id]);
-      if (res.rows.length === 0) return reply.status(404).send({ error: 'Job not found' });
-      return reply.send(res.rows[0]);
+    async (
+      request: FastifyRequest<{ Params: JobParams }>,
+      reply: FastifyReply
+    ) => {
+      const { id } = request.params;
+
+      const result = await pool.query(
+        `SELECT id, tenant_id, status, prompt, result, provider_resolved, model_resolved, error_message, created_at, updated_at
+         FROM jobs
+         WHERE id = $1`,
+        [id]
+      );
+
+      if (result.rows.length === 0) {
+        return reply.status(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `Job with ID ${id} not found.`,
+        });
+      }
+
+      return reply.status(200).send(result.rows[0]);
     }
   );
 
-  // 3. Real-Time SSE Stream Endpoint
-  fastify.get<{ Params: { id: string } }>(
+  // 3. Stream job status updates via Server-Sent Events (SSE)
+  server.get(
     '/v1/jobs/:id/stream',
-    async (req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
-      const { id } = req.params;
+    async (
+      request: FastifyRequest<{ Params: JobParams }>,
+      reply: FastifyReply
+    ) => {
+      const { id } = request.params;
 
-      // Set standard SSE headers
+      const jobResult = await pool.query(
+        `SELECT id, status, result, error_message FROM jobs WHERE id = $1`,
+        [id]
+      );
+
+      if (jobResult.rows.length === 0) {
+        return reply.status(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `Job with ID ${id} not found.`,
+        });
+      }
+
+      const job = jobResult.rows[0];
+
       reply.raw.setHeader('Content-Type', 'text/event-stream');
       reply.raw.setHeader('Cache-Control', 'no-cache');
       reply.raw.setHeader('Connection', 'keep-alive');
-      reply.raw.setHeader('Access-Control-Allow-Origin', '*');
+      reply.raw.flushHeaders();
 
-      // Check current DB status first in case it finished before stream opened
-      const currentRes = await pool.query(`SELECT status, result, error_message FROM jobs WHERE id = $1`, [id]);
-      if (currentRes.rows.length === 0) {
-        reply.raw.write(`event: error\ndata: ${JSON.stringify({ error: 'Job not found' })}\n\n`);
+      // If job already reached a terminal state, emit and close immediately
+      if (job.status === 'completed' || job.status === 'failed') {
+        reply.raw.write(`data: ${JSON.stringify(job)}\n\n`);
         return reply.raw.end();
       }
 
-      const initialStatus = currentRes.rows[0];
-      reply.raw.write(`event: update\ndata: ${JSON.stringify(initialStatus)}\n\n`);
+      // Emit initial status
+      reply.raw.write(
+        `data: ${JSON.stringify({ status: job.status, jobId: id })}\n\n`
+      );
 
-      if (initialStatus.status === 'completed' || initialStatus.status === 'failed') {
-        return reply.raw.end();
-      }
+      // Create a dedicated subscriber client to listen to Redis Pub/Sub events
+      const subscriber = redisPublisher.duplicate();
+      await subscriber.connect();
 
-      // Create a dedicated Redis subscriber client for this active connection
-      const subscriber = new Redis({
-        host: process.env.REDIS_HOST || '127.0.0.1',
-        port: Number(process.env.REDIS_PORT) || 6379,
-      });
+      const channel = `job-events:${id}`;
 
-      await subscriber.subscribe(`job-events:${id}`);
+      await subscriber.subscribe(channel, (message: string) => {
+        reply.raw.write(`data: ${message}\n\n`);
 
-      subscriber.on('message', (_channel, message) => {
-        reply.raw.write(`event: update\ndata: ${message}\n\n`);
-        const parsed = JSON.parse(message);
-        if (parsed.status === 'completed' || parsed.status === 'failed') {
-          subscriber.unsubscribe();
-          subscriber.quit();
-          reply.raw.end();
+        try {
+          const parsed = JSON.parse(message);
+          if (parsed.status === 'completed' || parsed.status === 'failed') {
+            subscriber.unsubscribe(channel);
+            subscriber.quit();
+            reply.raw.end();
+          }
+        } catch {
+          // Continue streaming if parsing fails
         }
       });
 
-      // Cleanup if the client disconnects prematurely
-      req.raw.on('close', () => {
-        subscriber.unsubscribe();
-        subscriber.quit();
+      request.raw.on('close', async () => {
+        try {
+          await subscriber.unsubscribe(channel);
+          await subscriber.quit();
+        } catch {
+          // Cleanup ignore
+        }
       });
     }
   );
-  // GET /v1/tenants/analytics
-fastify.get('/v1/tenants/analytics', async (req: FastifyRequest, reply: FastifyReply) => {
-  const apiKey = req.headers['x-api-key'] as string;
-  if (!apiKey) return reply.status(401).send({ error: 'Missing x-api-key' });
-
-  // Fetch tenant info and aggregated telemetry
-  const query = `
-    SELECT 
-      t.id AS tenant_id,
-      t.name AS tenant_name,
-      t.rpm_limit,
-      COUNT(j.id)::INT AS total_jobs,
-      COUNT(CASE WHEN j.status = 'completed' THEN 1 END)::INT AS completed_jobs,
-      COUNT(CASE WHEN j.status = 'failed' THEN 1 END)::INT AS failed_jobs,
-      COALESCE(AVG(j.latency_ms)::INT, 0) AS avg_latency_ms,
-      COALESCE(SUM(u.prompt_tokens), 0)::INT AS total_prompt_tokens,
-      COALESCE(SUM(u.completion_tokens), 0)::INT AS total_completion_tokens
-    FROM tenants t
-    LEFT JOIN jobs j ON t.id = j.tenant_id
-    LEFT JOIN usage_logs u ON j.id = u.job_id
-    WHERE t.api_key = $1
-    GROUP BY t.id, t.name, t.rpm_limit;
-  `;
-
-  const res = await pool.query(query, [apiKey]);
-
-  if (res.rows.length === 0) {
-    return reply.status(404).send({ error: 'Tenant not found' });
-  }
-
-  return reply.send(res.rows[0]);
-});
 }

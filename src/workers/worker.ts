@@ -1,10 +1,13 @@
 import { Worker, Job } from 'bullmq';
 import { redisOptions, redisPublisher } from '../config/redis.js';
 import { pool } from '../config/db.js';
+import { TelemetryService } from '../services/telemetry.js';
 import { LLMOrchestrator } from './orchestrator.js';
 import { AIJobPayload } from '../types/index.js';
 import { PromptCache } from '../services/cache.js';
 import { log } from 'console';
+
+
 
 export function startWorker() {
   const worker = new Worker(
@@ -73,6 +76,16 @@ export function startWorker() {
           latencyMs: result.latencyMs,
         })
       );
+      await TelemetryService.recordUsage({
+        tenantId: job.data.tenantId,
+        jobId: job.data.jobId,
+        provider: result.providerResolved,
+        model: result.modelResolved,
+        promptTokens: result.tokens.prompt,
+        completionTokens: result.tokens.completion,
+        latencyMs: result.latencyMs,
+        isCached: false,
+      });
 
       console.log(`[Worker] Finished job ${jobId}`);
       return result;
